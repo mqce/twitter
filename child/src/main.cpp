@@ -20,6 +20,7 @@ constexpr uint32_t kHelloLostTimeoutMs = 2000;
 constexpr uint32_t kPartnerSignalLostTimeoutMs = 2000;
 constexpr uint32_t kPartnerTurnTimeoutMs = 10000;
 constexpr uint32_t kActiveIntervalMs = 150;
+constexpr uint8_t kDoneRepeatCount = 3;
 constexpr uint32_t kTalkingMinDurationMs = 600;
 constexpr uint32_t kTalkingMaxDurationMs = 2000;
 constexpr uint32_t kTalkStartDelayMinMs = 200;
@@ -81,6 +82,7 @@ uint32_t partnerTurnStartedAtMs = 0;
 uint32_t lastActiveAtMs = 0;
 uint32_t currentTurnEndsAtMs = 0;
 uint32_t lastDoneSentAtMs = 0;
+uint8_t pendingDoneRepeats = 0;
 bool handshakeComplete = false;
 ConversationState state = ConversationState::Idle;
 bool voiceToneOn = false;
@@ -144,6 +146,7 @@ void resetConversationState(const char *reason) {
   lastActiveAtMs = 0;
   currentTurnEndsAtMs = 0;
   lastDoneSentAtMs = 0;
+  pendingDoneRepeats = 0;
   voiceToneOn = false;
   voiceSegmentStartedAtMs = 0;
   voiceSegmentEndsAtMs = 0;
@@ -372,6 +375,7 @@ void startChildTalking(const char *reason) {
   partnerTurnStartedAtMs = 0;
   lastPartnerSignalAtMs = 0;
   lastDoneSentAtMs = 0;
+  pendingDoneRepeats = 0;
   lastActiveAtMs = 0;
   currentTurnEndsAtMs = millis() + nextTalkingDurationMs();
   voiceLeadInEndsAtMs = millis() + randomRangeMs(kVoiceLeadInMinMs, kVoiceLeadInMaxMs);
@@ -404,6 +408,7 @@ void finishChildTalking() {
   logStatef("Child finished speech pattern; handing baton to parent");
   sendFrame(MsgType::DoneChild);
   lastDoneSentAtMs = millis();
+  pendingDoneRepeats = kDoneRepeatCount > 0 ? kDoneRepeatCount - 1 : 0;
   currentTurnEndsAtMs = 0;
   lastActiveAtMs = 0;
   lastPartnerSignalAtMs = 0;
@@ -424,9 +429,10 @@ void updateChildTalking(const uint32_t now) {
 
 void updateParentTalking(const uint32_t now) {
   if (partnerTurnStartedAtMs == 0) {
-    if (stateEnteredAtMs != 0 && now - stateEnteredAtMs > kPartnerTurnTimeoutMs) {
-      logStatef("Parent turn start timeout; reclaiming turn");
-      startChildTalking("parent turn start timeout recovery");
+    // Once we hand off to the parent, lack of any ACTIVE,P means the session
+    // is gone. Reset quickly so a fresh HELLO/ACK handshake can restart.
+    if (stateEnteredAtMs != 0 && now - stateEnteredAtMs > kPartnerSignalLostTimeoutMs) {
+      resetConversationState("parent turn start timeout");
     }
     return;
   }
@@ -446,9 +452,10 @@ void keepSendingDoneChildWhileWaiting(const uint32_t now) {
     return;
   }
 
-  if (lastDoneSentAtMs == 0 || now - lastDoneSentAtMs >= kActiveIntervalMs) {
+  if (pendingDoneRepeats > 0 && now - lastDoneSentAtMs >= kActiveIntervalMs) {
     sendFrame(MsgType::DoneChild);
     lastDoneSentAtMs = now;
+    --pendingDoneRepeats;
   }
 }
 }  // namespace
@@ -470,23 +477,27 @@ void loop() {
   if (decodePartnerFrame(frame)) {
     switch (frame.type) {
       case MsgType::Hello:
-        if (state == ConversationState::Idle) {
-          if (lastHelloAtMs != 0 && now - lastHelloAtMs <= kHelloGapLimitMs) {
-            ++consecutiveHelloCount;
-          } else {
-            consecutiveHelloCount = 1;
-          }
+        if (state != ConversationState::Idle) {
+          // Parent only sends HELLO while idle. Seeing HELLO mid-session means
+          // both sides lost sync, so drop back to handshake immediately.
+          resetConversationState("received HELLO while not idle");
+        }
 
-          lastHelloAtMs = now;
-          scheduledAckAtMs = now + kAckDelayMs;
-          if (!handshakeComplete) {
-            logStatef("RX HELLO (%u/%u)", consecutiveHelloCount, kHandshakeSuccessCount);
-          }
+        if (lastHelloAtMs != 0 && now - lastHelloAtMs <= kHelloGapLimitMs) {
+          ++consecutiveHelloCount;
+        } else {
+          consecutiveHelloCount = 1;
+        }
 
-          if (!handshakeComplete && consecutiveHelloCount >= kHandshakeSuccessCount) {
-            handshakeComplete = true;
-            logStatef("Handshake complete; waiting for parent turn");
-          }
+        lastHelloAtMs = now;
+        scheduledAckAtMs = now + kAckDelayMs;
+        if (!handshakeComplete) {
+          logStatef("RX HELLO (%u/%u)", consecutiveHelloCount, kHandshakeSuccessCount);
+        }
+
+        if (!handshakeComplete && consecutiveHelloCount >= kHandshakeSuccessCount) {
+          handshakeComplete = true;
+          logStatef("Handshake complete; waiting for parent turn");
         }
         break;
 

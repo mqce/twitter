@@ -18,6 +18,7 @@ constexpr uint32_t kPartnerSignalLostTimeoutMs = 2000;
 constexpr uint32_t kPartnerTurnTimeoutMs = 10000;
 constexpr uint8_t kHandshakeSuccessCount = 3;
 constexpr uint32_t kActiveIntervalMs = 150;
+constexpr uint8_t kDoneRepeatCount = 3;
 constexpr uint32_t kTalkingMinDurationMs = 600;
 constexpr uint32_t kTalkingMaxDurationMs = 2000;
 constexpr uint32_t kTalkStartDelayMinMs = 200;
@@ -78,6 +79,7 @@ uint32_t partnerTurnStartedAtMs = 0;
 uint32_t lastActiveAtMs = 0;
 uint32_t currentTurnEndsAtMs = 0;
 uint32_t lastDoneSentAtMs = 0;
+uint8_t pendingDoneRepeats = 0;
 bool waitingAck = false;
 uint8_t consecutiveAckCount = 0;
 ConversationState state = ConversationState::Idle;
@@ -141,6 +143,7 @@ void resetConversationState(const char *reason) {
   lastActiveAtMs = 0;
   currentTurnEndsAtMs = 0;
   lastDoneSentAtMs = 0;
+  pendingDoneRepeats = 0;
   voiceToneOn = false;
   voiceSegmentStartedAtMs = 0;
   voiceSegmentEndsAtMs = 0;
@@ -369,6 +372,7 @@ void startParentTalking(const char *reason) {
   partnerTurnStartedAtMs = 0;
   lastPartnerSignalAtMs = 0;
   lastDoneSentAtMs = 0;
+  pendingDoneRepeats = 0;
   lastActiveAtMs = 0;
   currentTurnEndsAtMs = millis() + nextTalkingDurationMs();
   voiceLeadInEndsAtMs = millis() + randomRangeMs(kVoiceLeadInMinMs, kVoiceLeadInMaxMs);
@@ -401,6 +405,7 @@ void finishParentTalking() {
   logStatef("Parent finished speech pattern; handing baton to child");
   sendFrame(MsgType::DoneParent);
   lastDoneSentAtMs = millis();
+  pendingDoneRepeats = kDoneRepeatCount > 0 ? kDoneRepeatCount - 1 : 0;
   currentTurnEndsAtMs = 0;
   lastActiveAtMs = 0;
   lastPartnerSignalAtMs = 0;
@@ -421,14 +426,17 @@ void updateParentTalking(const uint32_t now) {
 
 void updateChildTalking(const uint32_t now) {
   if (partnerTurnStartedAtMs == 0) {
-    if (lastDoneSentAtMs == 0 || now - lastDoneSentAtMs >= kActiveIntervalMs) {
+    if (pendingDoneRepeats > 0 && now - lastDoneSentAtMs >= kActiveIntervalMs) {
       sendFrame(MsgType::DoneParent);
       lastDoneSentAtMs = now;
+      --pendingDoneRepeats;
     }
 
-    if (stateEnteredAtMs != 0 && now - stateEnteredAtMs > kPartnerTurnTimeoutMs) {
-      logStatef("Child turn start timeout; reclaiming turn");
-      startParentTalking("child turn start timeout recovery");
+    // If the child never starts its turn after our handoff, treat it as a
+    // broken session and go back to handshake instead of self-recovering into
+    // a solo conversation loop.
+    if (stateEnteredAtMs != 0 && now - stateEnteredAtMs > kPartnerSignalLostTimeoutMs) {
+      resetConversationState("child turn start timeout");
     }
     return;
   }
